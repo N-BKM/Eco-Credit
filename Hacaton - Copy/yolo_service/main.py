@@ -34,8 +34,21 @@ if YOLO_AVAILABLE:
     try:
         yolo_model = YOLO("yolov8n.pt")  # Auto-downloads lightweight YOLOv8 nano checkpoint
         print("Successfully loaded Ultralytics YOLOv8n object detection model.")
+        # Warm-up pass: PyTorch's first inference on CPU pays a one-time JIT/thread-pool
+        # setup cost (seen as 30+ second latency). Running one dummy inference now, at
+        # startup, moves that cost off of the first real user request.
+        try:
+            warmup_image = Image.new("RGB", (640, 480), color=(0, 0, 0))
+            yolo_model(warmup_image, conf=0.30, verbose=False)
+            print("YOLO warm-up inference complete — first real request will be fast.")
+        except Exception as warmup_err:
+            print(f"Warning: YOLO warm-up inference failed (non-fatal): {warmup_err}")
     except Exception as e:
         print(f"Warning: Could not load YOLO model: {e}")
+
+# Minimum confidence for a detection to be trusted. Lowered from the original 0.30
+# so borderline-but-real detections aren't thrown away as "no detections".
+DETECTION_CONFIDENCE_THRESHOLD = 0.18
 
 # Category Mapping Dictionary
 WASTE_CATEGORY_MAP: Dict[str, str] = {
@@ -136,7 +149,7 @@ async def classify_image(request: Request):
 
         if yolo_model is not None:
             try:
-                results = yolo_model(image, conf=0.30)
+                results = yolo_model(image, conf=DETECTION_CONFIDENCE_THRESHOLD)
                 for r in results:
                     if hasattr(r, "boxes") and r.boxes is not None:
                         for box in r.boxes:
@@ -197,31 +210,47 @@ async def classify_image(request: Request):
                 "engine": "Ultralytics YOLOv8 Multimodal Engine"
             }
 
-        # Heuristic Fallback Classifier if no objects detected by YOLO
-        category = "Recyclable"
-        item_name = "YOLO Class 39: PET Plastic Bottle"
-        if "paper" in filename_lower or "box" in filename_lower or "cardboard" in filename_lower:
-            category = "Paper"
-            item_name = "YOLO Class 73: Cardboard Packaging"
-        elif "battery" in filename_lower or "phone" in filename_lower or "wire" in filename_lower:
-            category = "E-Waste"
-            item_name = "YOLO Class 67: Electronic Component"
-        elif "apple" in filename_lower or "food" in filename_lower or "banana" in filename_lower:
-            category = "Organic"
-            item_name = "YOLO Class 47: Organic Food Matter"
-        elif "glass" in filename_lower:
-            category = "Glass"
-            item_name = "YOLO Class 40: Glass Container"
+        # Filename hints can still help when YOLO finds nothing (e.g. a user names their
+        # file "cardboard.jpg"), but we no longer silently default to "PET bottle" when
+        # there's no real signal at all — that was misleading. If neither YOLO nor the
+        # filename gives us anything to go on, say so honestly.
+        filename_category_hints = [
+            ("paper", "Paper", "cardboard or paper packaging"),
+            ("box", "Paper", "cardboard or paper packaging"),
+            ("cardboard", "Paper", "cardboard or paper packaging"),
+            ("battery", "E-Waste", "an electronic/battery component"),
+            ("phone", "E-Waste", "an electronic/battery component"),
+            ("wire", "E-Waste", "an electronic/battery component"),
+            ("apple", "Organic", "organic/food matter"),
+            ("food", "Organic", "organic/food matter"),
+            ("banana", "Organic", "organic/food matter"),
+            ("glass", "Glass", "a glass container"),
+            ("bottle", "Recyclable", "a plastic bottle"),
+            ("plastic", "Recyclable", "a plastic item"),
+            ("can", "Recyclable", "a recyclable container"),
+        ]
 
+        for keyword, category, description_hint in filename_category_hints:
+            if keyword in filename_lower:
+                return {
+                    "is_waste": True,
+                    "category": category,
+                    "confidence": 70.0,
+                    "item_name": f"Filename-inferred: {description_hint}",
+                    "description": f"YOLOv8 did not confidently detect an object in the image, so this was inferred from the filename ('{filename}') as {description_hint}. For a more reliable result, try a clearer, well-lit photo with the item centered.",
+                    "recommended_bin_category": category if category != "Glass" else "Recyclable",
+                    "detections": detections,
+                    "mapped_category": category,
+                    "engine": "Ultralytics YOLOv8 Multimodal Engine (filename fallback)"
+                }
+
+        # No YOLO detection and no usable filename hint — be honest rather than guessing.
         return {
-            "is_waste": True,
-            "category": category,
-            "confidence": 95.4,
-            "item_name": item_name,
-            "description": "Object localized and classified via YOLOv8 neural network engine.",
-            "recommended_bin_category": category if category != "Glass" else "Recyclable",
-            "detections": [{"class": category.lower(), "confidence": 0.954, "bbox": [50, 40, 200, 220]}],
-            "mapped_category": category,
+            "is_waste": False,
+            "reason": "no_confident_detection",
+            "message": "We couldn't confidently identify an item in this photo. YOLOv8n recognizes common everyday objects (bottles, cans, cups, paper, food, electronics, glass) — try a clearer, well-lit photo with the item centered and filling most of the frame.",
+            "confidence": 0.0,
+            "detections": detections,
             "engine": "Ultralytics YOLOv8 Multimodal Engine"
         }
 
