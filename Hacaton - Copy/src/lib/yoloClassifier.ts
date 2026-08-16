@@ -15,10 +15,12 @@ export interface YoloClassificationResult extends ClassificationResult {
   model_type: 'YOLOv8-Multimodal-Vision';
 }
 
+const YOLO_SERVICE_URL = import.meta.env.VITE_YOLO_SERVICE_URL || 'http://localhost:8000';
+
 export async function classifyWithYoloModel(imageBase64: string, imageName: string): Promise<YoloClassificationResult> {
   // 1. Try Direct Python FastAPI Microservice endpoint if running locally or deployed
   try {
-    const directRes = await fetch('http://localhost:8000/classify', {
+    const directRes = await fetch(`${YOLO_SERVICE_URL}/classify`, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify({ imageBase64, imageName })
